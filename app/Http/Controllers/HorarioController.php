@@ -1,0 +1,335 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Http\Requests\UpdateHorarioRequest;
+use App\Models\Cancha;
+use App\Models\ClubSetting;
+use App\Models\Horario;
+use App\Models\Tarifa;
+use App\Services\ReglasReserva;
+use Illuminate\Database\QueryException;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\View\View;
+
+// CONTROLADOR DE HORARIOS: GESTIONA LOS SLOTS DE TIEMPO RESERVABLES
+// METODOS: index (LISTAR), create/store (GENERACION MASIVA), edit/update, destroy
+// METODOS EXTRA: cambiarTarifaMasiva (CAMBIO EN LOTE), eliminarDia (BORRADO EN LOTE)
+// ACCESO: SOLO ADMIN (PROTEGIDO POR MIDDLEWARE role:admin EN web.php)
+class HorarioController extends Controller
+{
+    public function index(Request $request): View|RedirectResponse
+    {
+        try {
+            $fechaStr = $request->query('fecha', Carbon::today()->toDateString());
+            $canchaId = $request->query('cancha');
+
+            // Fecha inválida en la URL: caer al día de hoy en vez de expulsar al usuario
+            try {
+                $fecha = Carbon::parse($fechaStr)->startOfDay();
+            } catch (\Throwable) {
+                $fecha = Carbon::today();
+            }
+
+            $canchas = Cancha::orderBy('id')->get();
+            $tarifas = Tarifa::orderBy('nombre_tarifa')->get();
+
+            $query = Horario::with(['cancha', 'tarifa'])
+                ->whereDate('hora_inicio', $fecha)
+                ->orderBy('hora_inicio')
+                ->orderBy('cancha_id');
+
+            if ($canchaId) {
+                $query->where('cancha_id', $canchaId);
+            }
+
+            $horarios = $query->get();
+
+            $fechas = collect(range(0, 6))->map(fn ($i) => Carbon::today()->addDays($i));
+
+            $stats = [
+                'total' => $horarios->count(),
+                'disponible' => $horarios->where('estado', 'disponible')->count(),
+                'reservado' => $horarios->where('estado', 'reservado')->count(),
+            ];
+
+            return view('horarios.index', compact(
+                'horarios', 'canchas', 'tarifas', 'fecha', 'fechaStr', 'canchaId', 'fechas', 'stats'
+            ));
+        } catch (\Throwable $e) {
+            Log::error('Error al listar horarios', ['error' => $e->getMessage()]);
+
+            return redirect()->route('dashboard')
+                ->withErrors(['general' => 'No se pudieron cargar los horarios. Intenta de nuevo.']);
+        }
+    }
+
+    // CAMBIO MASIVO DE TARIFA: PERMITE SELECCIONAR VARIOS HORARIOS Y CAMBIAR SU TARIFA EN LOTE
+    // SOLO AFECTA HORARIOS CON ESTADO 'disponible' (LOS RESERVADOS NO SE TOCAN)
+    // SE USA PARA APLICAR TARIFAS DE OFERTA A FRANJAS HORARIAS ESPECIFICAS
+    public function cambiarTarifaMasiva(Request $request): RedirectResponse
+    {
+        $validated = $request->validate([
+            'horario_ids' => ['required', 'array', 'min:1'],
+            'horario_ids.*' => ['integer', 'exists:horarios,id'],
+            'tarifa_id' => ['required', 'exists:tarifas,id'],
+        ], [
+            'horario_ids.required' => 'Selecciona al menos un horario.',
+            'tarifa_id.required' => 'Selecciona una tarifa.',
+        ]);
+
+        try {
+            $actualizados = Horario::whereIn('id', $validated['horario_ids'])
+                ->where('estado', 'disponible')
+                ->update(['tarifa_id' => $validated['tarifa_id']]);
+
+            $tarifa = Tarifa::find($validated['tarifa_id']);
+
+            return back()->with('success', "{$actualizados} horarios actualizados a {$tarifa->nombre_tarifa}.");
+        } catch (\Throwable $e) {
+            Log::error('Error al cambiar tarifa masiva', ['error' => $e->getMessage()]);
+
+            return back()->withErrors(['general' => 'No se pudo cambiar la tarifa.']);
+        }
+    }
+
+    public function create(): View|RedirectResponse
+    {
+        try {
+            $canchas = Cancha::where('estado_mantenimiento', 'operativa')->orderBy('id')->get();
+            $tarifas = Tarifa::orderBy('nombre_tarifa')->get();
+
+            return view('horarios.create', compact('canchas', 'tarifas'));
+        } catch (\Throwable $e) {
+            Log::error('Error al mostrar formulario de horario', ['error' => $e->getMessage()]);
+
+            return redirect()->route('horarios.index')
+                ->withErrors(['general' => 'No se pudo cargar el formulario. Intenta de nuevo.']);
+        }
+    }
+
+    // STORE: GENERACION MASIVA DE HORARIOS
+    // RECIBE: RANGO DE FECHAS + HORAS DE OPERACION + CANCHAS + TARIFAS POR FRANJA
+    // ITERA: FECHA x CANCHA x HORA, SALTA DUPLICADOS, ASIGNA TARIFA DIA O NOCHE
+    // EXPO: generacion masiva: recorro fecha x cancha x hora, salto los que ya existen
+    // y asigno tarifa dia (antes de las 18) o noche
+    public function store(Request $request): RedirectResponse
+    {
+        $validated = $request->validate([
+            'fecha_inicio' => ['required', 'date', 'after_or_equal:today'],
+            'fecha_fin' => ['required', 'date', 'after_or_equal:fecha_inicio', 'before_or_equal:'.now()->addDays(365)->toDateString()],
+            'hora_desde' => ['required', 'integer', 'min:0', 'max:23'],
+            'hora_hasta' => ['required', 'integer', 'min:1', 'max:24', 'gt:hora_desde'],
+            'canchas' => ['required', 'array', 'min:1'],
+            'canchas.*' => ['exists:canchas,id'],
+            'tarifa_dia' => ['nullable', 'exists:tarifas,id'],
+            'tarifa_noche' => ['nullable', 'exists:tarifas,id'],
+        ], [
+            'fecha_inicio.required' => 'La fecha de inicio es obligatoria.',
+            'fecha_fin.after_or_equal' => 'La fecha fin debe ser igual o posterior a la de inicio.',
+            'canchas.required' => 'Selecciona al menos una cancha.',
+            'hora_hasta.gt' => 'La hora final debe ser mayor que la hora de inicio.',
+        ]);
+
+        try {
+            $inicio = Carbon::parse($validated['fecha_inicio']);
+            $fin = Carbon::parse($validated['fecha_fin']);
+            $horaDesde = (int) $validated['hora_desde'];
+            $horaHasta = (int) $validated['hora_hasta'];
+
+            $tarifaDia = $validated['tarifa_dia'] ?? null;
+            $tarifaNoche = $validated['tarifa_noche'] ?? null;
+
+            $creados = 0;
+            $omitidos = 0;
+            $reglas = ClubSetting::reglas();
+            DB::transaction(function () use ($inicio, $fin, $validated, $horaDesde, $horaHasta, $tarifaDia, $tarifaNoche, $reglas, &$creados, &$omitidos) {
+                for ($fecha = $inicio->copy(); $fecha->lte($fin); $fecha->addDay()) {
+                    foreach ($validated['canchas'] as $canchaId) {
+                        $cancha = Cancha::whereKey($canchaId)->lockForUpdate()->firstOrFail();
+                        if (! $cancha->estaOperativa()) {
+                            continue;
+                        }
+                        for ($minuto = $horaDesde * 60; $minuto + $reglas['duracion_minutos'] <= $horaHasta * 60; $minuto += $reglas['duracion_minutos']) {
+                            $hora = intdiv($minuto, 60);
+                            $horaInicio = $fecha->copy()->startOfDay()->addMinutes($minuto);
+                            $horaFin = $horaInicio->copy()->addMinutes($reglas['duracion_minutos']);
+                            $slot = new Horario(['hora_inicio' => $horaInicio, 'hora_fin' => $horaFin]);
+                            if (! app(ReglasReserva::class)->permite($slot)) {
+                                $omitidos++;
+
+                                continue;
+                            }
+
+                            $existe = Horario::where('cancha_id', $canchaId)
+                                ->where('hora_inicio', '<', $horaFin)
+                                ->where('hora_fin', '>', $horaInicio)
+                                ->exists();
+
+                            if ($existe) {
+                                $omitidos++;
+
+                                continue;
+                            }
+
+                            $tarifaId = $hora < 18 ? $tarifaDia : $tarifaNoche;
+
+                            if (! $tarifaId) {
+                                $omitidos++;
+
+                                continue;
+                            }
+
+                            Horario::create([
+                                'cancha_id' => $canchaId,
+                                'tarifa_id' => $tarifaId,
+                                'hora_inicio' => $horaInicio,
+                                'hora_fin' => $horaFin,
+                                'estado' => 'disponible',
+                            ]);
+                            $creados++;
+                        }
+                    }
+                }
+            });
+            $msg = "{$creados} horarios generados correctamente.";
+            if ($omitidos > 0) {
+                $msg .= " {$omitidos} omitidos (ya existían o sin tarifa).";
+            }
+
+            return redirect()->route('horarios.index')->with('success', $msg);
+
+        } catch (\Throwable $e) {
+            Log::error('Error al generar horarios masivos', ['error' => $e->getMessage()]);
+
+            return back()->withInput()
+                ->withErrors(['general' => 'No se pudieron generar los horarios. Revisa las fechas, canchas y tarifas e intenta de nuevo.']);
+        }
+    }
+
+    public function edit(Horario $horario): View|RedirectResponse
+    {
+        try {
+            if ($horario->estado === 'reservado') {
+                return redirect()->route('horarios.index')
+                    ->withErrors(['general' => 'No se puede editar un horario que ya está reservado.']);
+            }
+
+            $canchas = Cancha::where('estado_mantenimiento', 'operativa')->orderBy('id')->get();
+            $tarifas = Tarifa::orderBy('nombre_tarifa')->get();
+
+            return view('horarios.edit', compact('horario', 'canchas', 'tarifas'));
+
+        } catch (\Throwable $e) {
+            Log::error('Error al mostrar edición de horario', ['horario_id' => $horario->id, 'error' => $e->getMessage()]);
+
+            return redirect()->route('horarios.index')
+                ->withErrors(['general' => 'No se pudo cargar el formulario de edición. Intenta de nuevo.']);
+        }
+    }
+
+    public function update(UpdateHorarioRequest $request, Horario $horario): RedirectResponse
+    {
+        try {
+            if ($horario->estado === 'reservado') {
+                return back()->withErrors([
+                    'general' => 'No se puede modificar un horario que ya está reservado.',
+                ]);
+            }
+
+            DB::transaction(function () use ($request, $horario) {
+                $datos = $request->validated();
+                Cancha::whereIn('id', [$horario->cancha_id, $datos['cancha_id']])->orderBy('id')->lockForUpdate()->get();
+                $horario = Horario::whereKey($horario->id)->lockForUpdate()->firstOrFail();
+                if ($horario->estado === 'reservado') {
+                    throw new \RuntimeException('Horario reservado');
+                }
+                $cruce = Horario::where('cancha_id', $datos['cancha_id'])->where('id', '!=', $horario->id)
+                    ->where('hora_inicio', '<', $datos['hora_fin'])->where('hora_fin', '>', $datos['hora_inicio'])->exists();
+                if ($cruce) {
+                    throw new \RuntimeException('Cruce de horarios');
+                }
+                $horario->fill($datos)->load('cancha', 'tarifa');
+                app(ReglasReserva::class)->validar($horario);
+                $horario->save();
+            });
+
+            return redirect()->route('horarios.index')
+                ->with('success', 'Horario actualizado correctamente.');
+
+        } catch (QueryException $e) {
+            Log::error('Error al actualizar horario', ['horario_id' => $horario->id, 'error' => $e->getMessage()]);
+
+            return back()->withInput()
+                ->withErrors(['general' => 'No se pudo actualizar el horario. Intenta de nuevo.']);
+
+        } catch (\Throwable $e) {
+            Log::error('Error inesperado al actualizar horario', ['error' => $e->getMessage()]);
+
+            return back()->withInput()
+                ->withErrors(['general' => 'Ocurrió un error inesperado. Contacta al administrador.']);
+        }
+    }
+
+    public function eliminarDia(Request $request): RedirectResponse
+    {
+        $request->validate(['fecha' => ['required', 'date']]);
+
+        try {
+            $fecha = Carbon::parse($request->fecha);
+            $canchaId = $request->cancha_id;
+
+            $query = Horario::whereDate('hora_inicio', $fecha)
+                ->where('estado', 'disponible');
+
+            if ($canchaId) {
+                $query->where('cancha_id', $canchaId);
+            }
+
+            $eliminados = $query->delete();
+
+            return redirect()->route('horarios.index', ['fecha' => $request->fecha, 'cancha' => $canchaId])
+                ->with('success', "{$eliminados} horarios eliminados.");
+        } catch (\Throwable $e) {
+            Log::error('Error al eliminar horarios del día', ['error' => $e->getMessage()]);
+
+            return back()->withErrors(['general' => 'No se pudieron eliminar los horarios.']);
+        }
+    }
+
+    public function destroy(Horario $horario): RedirectResponse
+    {
+        try {
+            if ($horario->estado === 'reservado') {
+                return back()->withErrors([
+                    'general' => 'No se puede eliminar un horario que tiene una reserva. Cancélala primero.',
+                ]);
+            }
+
+            DB::transaction(function () use ($horario) {
+                $horario = Horario::whereKey($horario->id)->lockForUpdate()->firstOrFail();
+                if ($horario->estado !== 'disponible') {
+                    throw new \RuntimeException('Horario reservado');
+                }
+                $horario->delete();
+            });
+
+            return redirect()->route('horarios.index')
+                ->with('success', 'Horario eliminado correctamente.');
+
+        } catch (QueryException $e) {
+            Log::error('Error al eliminar horario', ['horario_id' => $horario->id, 'error' => $e->getMessage()]);
+
+            return back()->withErrors(['general' => 'No se pudo eliminar el horario: tiene registros dependientes.']);
+
+        } catch (\Throwable $e) {
+            Log::error('Error inesperado al eliminar horario', ['error' => $e->getMessage()]);
+
+            return back()->withErrors(['general' => 'Ocurrió un error inesperado al eliminar el horario.']);
+        }
+    }
+}
